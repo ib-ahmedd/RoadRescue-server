@@ -3,6 +3,8 @@ import cors from "cors";
 import providersRouter from "./routes/providers";
 import requestsRouter from "./routes/requests";
 import contactRouter from "./routes/contact";
+import disputesRouter from "./routes/disputes";
+import applicationsRouter from "./routes/applications";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -21,6 +23,8 @@ app.use(express.json());
 app.use("/api/providers", providersRouter);
 app.use("/api/requests", requestsRouter);
 app.use("/api/contact", contactRouter);
+app.use("/api/disputes", disputesRouter);
+app.use("/api/applications", applicationsRouter);
 
 // ── Health check ────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {

@@ -49,6 +49,30 @@ export interface ContactSubmission {
   createdAt: string;
 }
 
+export interface Dispute {
+  id: string;
+  requestId: string;
+  customerName: string;
+  customerPhone: string;
+  reason: string;
+  description: string;
+  status: "open" | "reviewing" | "resolved";
+  createdAt: string;
+}
+
+export interface Application {
+  id: string;
+  name: string;
+  phone: string;
+  vehicle: string;
+  plate: string;
+  speciality: string;
+  avatar: string;
+  licenseId: string;
+  status: "pending" | "approved" | "rejected";
+  createdAt: string;
+}
+
 // ------- Database Setup -------
 
 const dbFile = path.join(__dirname, "..", "data", "roadrescue.db");
@@ -110,7 +134,38 @@ db.exec(`
     message   TEXT NOT NULL,
     createdAt TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS disputes (
+    id            TEXT PRIMARY KEY,
+    requestId     TEXT NOT NULL,
+    customerName  TEXT NOT NULL,
+    customerPhone TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    description   TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'open',
+    createdAt     TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS applications (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    phone         TEXT NOT NULL,
+    vehicle       TEXT NOT NULL,
+    plate         TEXT NOT NULL,
+    speciality    TEXT NOT NULL,
+    avatar        TEXT NOT NULL,
+    licenseId     TEXT NOT NULL,
+    licenseImage  TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    createdAt     TEXT NOT NULL
+  );
 `);
+
+try {
+  db.exec("ALTER TABLE applications ADD COLUMN licenseImage TEXT NOT NULL DEFAULT ''");
+} catch (e) {
+  // Column already exists, safe to ignore
+}
 
 // ------- Seed initial data from db.json if tables are empty -------
 
@@ -365,5 +420,146 @@ export function addContact(
   `).run(newContact);
   return newContact;
 }
+
+// ------- Dispute Functions -------
+
+export function getDisputes(): Dispute[] {
+  return db
+    .prepare("SELECT * FROM disputes ORDER BY createdAt DESC")
+    .all() as Dispute[];
+}
+
+export function addDispute(
+  dispute: Omit<Dispute, "id" | "createdAt" | "status">
+): Dispute {
+  const newDispute: Dispute = {
+    ...dispute,
+    id: "DS-" + Math.random().toString(36).substring(2, 8).toUpperCase(),
+    status: "open",
+    createdAt: new Date().toISOString(),
+  };
+  db.prepare(`
+    INSERT INTO disputes (id, requestId, customerName, customerPhone, reason, description, status, createdAt)
+    VALUES (@id, @requestId, @customerName, @customerPhone, @reason, @description, @status, @createdAt)
+  `).run(newDispute);
+  return newDispute;
+}
+
+export function updateDisputeStatus(
+  id: string,
+  status: Dispute["status"]
+): Dispute | null {
+  const existing = db.prepare("SELECT * FROM disputes WHERE id = ?").get(id) as Dispute | undefined;
+  if (!existing) return null;
+  db.prepare("UPDATE disputes SET status = ? WHERE id = ?").run(status, id);
+  return { ...existing, status };
+}
+
+// ------- Application Functions -------
+
+export function getApplications(): Application[] {
+  return db
+    .prepare("SELECT * FROM applications ORDER BY createdAt DESC")
+    .all() as Application[];
+}
+
+export function getApplicationById(id: string): Application | null {
+  return (
+    (db.prepare("SELECT * FROM applications WHERE id = ?").get(id) as Application) ||
+    null
+  );
+}
+
+export function addApplication(
+  app: Omit<Application, "id" | "status" | "createdAt">
+): Application {
+  const id = "APP-" + Math.random().toString(36).substring(2, 6).toUpperCase().padEnd(3, "0");
+  const newApp: Application = {
+    ...app,
+    id,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  };
+  db.prepare(`
+    INSERT INTO applications (id, name, phone, vehicle, plate, speciality, avatar, licenseId, licenseImage, status, createdAt)
+    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @avatar, @licenseId, @licenseImage, @status, @createdAt)
+  `).run(newApp);
+  return newApp;
+}
+
+export function updateApplicationStatus(
+  id: string,
+  status: "approved" | "rejected"
+): Application | null {
+  const existing = getApplicationById(id);
+  if (!existing) return null;
+
+  db.prepare("UPDATE applications SET status = ? WHERE id = ?").run(status, id);
+
+  // If approved, create corresponding active provider
+  if (status === "approved") {
+    // Check if provider already exists to prevent duplicate key
+    const existingProv = db.prepare("SELECT * FROM providers WHERE name = ? AND phone = ?").get(existing.name, existing.phone);
+    if (!existingProv) {
+      addProvider({
+        name: existing.name,
+        phone: existing.phone,
+        vehicle: existing.vehicle,
+        plate: existing.plate,
+        speciality: existing.speciality,
+        avatar: existing.avatar,
+      });
+    }
+  }
+
+  return { ...existing, status };
+}
+
+function seedApplications() {
+  const count = (db.prepare("SELECT COUNT(*) as c FROM applications").get() as { c: number }).c;
+  if (count > 0) return;
+
+  const mockApps = [
+    {
+      id: "APP-001",
+      name: "John Wayne Towing",
+      phone: "+1 (555) 321-7654",
+      vehicle: "Flatbed Truck (Dodge Ram 5500)",
+      plate: "JW-TOW-1",
+      speciality: "towing",
+      avatar: "JW",
+      licenseId: "DL-9827361",
+      licenseImage: "/mock_driver_license.jpg",
+      status: "pending",
+      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 4).toISOString(), // 4 hours ago
+    },
+    {
+      id: "APP-002",
+      name: "Sarah Jenkins Locksmith",
+      phone: "+1 (555) 789-0123",
+      vehicle: "Utility Van (Ford Transit)",
+      plate: "LOCK-SJ7",
+      speciality: "lockout",
+      avatar: "SJ",
+      licenseId: "DL-3847291",
+      licenseImage: "/mock_driver_license.jpg",
+      status: "pending",
+      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(), // 2 hours ago
+    }
+  ];
+
+  const insert = db.prepare(`
+    INSERT INTO applications (id, name, phone, vehicle, plate, speciality, avatar, licenseId, licenseImage, status, createdAt)
+    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @avatar, @licenseId, @licenseImage, @status, @createdAt)
+  `);
+
+  for (const app of mockApps) {
+    insert.run(app);
+  }
+  console.log(`✅ Seeded ${mockApps.length} technician applications.`);
+}
+
+// Run application seeder
+seedApplications();
 
 export default db;
