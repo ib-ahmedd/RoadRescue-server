@@ -1,11 +1,9 @@
 import Database from "better-sqlite3";
+import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// ------- Types -------
+// Resolved from the server package root (npm scripts run with cwd = server/).
+const SERVER_ROOT = process.cwd();
 
 export interface Provider {
   id: string;
@@ -37,6 +35,7 @@ export interface RequestData {
   status: "received" | "matched" | "en-route" | "arrived" | "completed";
   assignedProvider: Provider | null;
   contacted: boolean;
+  arrivalConfirmed: boolean;
   createdAt: string;
 }
 
@@ -60,6 +59,20 @@ export interface Dispute {
   createdAt: string;
 }
 
+export interface Provider {
+  id: string;
+  name: string;
+  phone: string;
+  vehicle: string;
+  plate: string;
+  speciality: string;
+  rating: number;
+  reviews: number;
+  status: "Available" | "Dispatched" | "Offline";
+  avatar: string;
+  username: string | null;
+}
+
 export interface Application {
   id: string;
   name: string;
@@ -69,17 +82,32 @@ export interface Application {
   speciality: string;
   avatar: string;
   licenseId: string;
+  licenseImage: string;
   status: "pending" | "approved" | "rejected";
+  providerId: string | null;
+  registered: boolean;
+  createdAt: string;
+}
+
+export interface ApplicationTrackView {
+  id: string;
+  name: string;
+  phone: string;
+  vehicle: string;
+  plate: string;
+  speciality: string;
+  status: Application["status"];
+  providerId: string | null;
+  registered: boolean;
+  canRegister: boolean;
   createdAt: string;
 }
 
 // ------- Database Setup -------
 
-const dbFile = path.join(__dirname, "..", "data", "roadrescue.db");
+const dbFile = path.join(SERVER_ROOT, "data", "roadrescue.db");
 
-// Ensure data directory exists
-import fs from "fs";
-const dataDir = path.join(__dirname, "..", "data");
+const dataDir = path.join(SERVER_ROOT, "data");
 if (!fs.existsSync(dataDir)) {
   fs.mkdirSync(dataDir, { recursive: true });
 }
@@ -167,12 +195,47 @@ try {
   // Column already exists, safe to ignore
 }
 
+try {
+  db.exec("ALTER TABLE applications ADD COLUMN providerId TEXT");
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec("ALTER TABLE applications ADD COLUMN registered INTEGER NOT NULL DEFAULT 0");
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec("ALTER TABLE providers ADD COLUMN username TEXT");
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec("ALTER TABLE providers ADD COLUMN password TEXT");
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec("ALTER TABLE requests ADD COLUMN arrivalConfirmed INTEGER NOT NULL DEFAULT 0");
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_username ON providers(username) WHERE username IS NOT NULL");
+} catch (e) {
+  // Index already exists
+}
+
 // ------- Seed initial data from db.json if tables are empty -------
 
 function seedFromJson() {
   const jsonPath = path.join(
-    __dirname,
-    "..",
+    SERVER_ROOT,
     "..",
     "frontend",
     "src",
@@ -248,29 +311,71 @@ seedFromJson();
 
 function parseRequest(row: Record<string, unknown>): RequestData {
   return {
-    ...(row as Omit<RequestData, "assignedProvider" | "contacted">),
+    ...(row as Omit<RequestData, "assignedProvider" | "contacted" | "arrivalConfirmed">),
     assignedProvider: row.assignedProvider
       ? JSON.parse(row.assignedProvider as string)
       : null,
     contacted: row.contacted === 1,
+    arrivalConfirmed: row.arrivalConfirmed === 1 || row.arrivalConfirmed === true,
   };
 }
 
 // ------- Provider Functions -------
 
+function parseProvider(row: Record<string, unknown>): Provider {
+  return {
+    id: row.id as string,
+    name: row.name as string,
+    phone: row.phone as string,
+    vehicle: row.vehicle as string,
+    plate: row.plate as string,
+    speciality: row.speciality as string,
+    rating: row.rating as number,
+    reviews: row.reviews as number,
+    status: row.status as Provider["status"],
+    avatar: row.avatar as string,
+    username: (row.username as string | null) ?? null,
+  };
+}
+
 export function getProviders(): Provider[] {
-  return db.prepare("SELECT * FROM providers").all() as Provider[];
+  return db
+    .prepare(
+      "SELECT id, name, phone, vehicle, plate, speciality, rating, reviews, status, avatar, username FROM providers"
+    )
+    .all()
+    .map((row) => parseProvider(row as Record<string, unknown>));
 }
 
 export function getProviderById(id: string): Provider | null {
-  return (
-    (db.prepare("SELECT * FROM providers WHERE id = ?").get(id) as Provider) ||
-    null
-  );
+  const row = db
+    .prepare(
+      "SELECT id, name, phone, vehicle, plate, speciality, rating, reviews, status, avatar, username FROM providers WHERE id = ?"
+    )
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? parseProvider(row) : null;
+}
+
+export function getProviderByUsername(username: string): (Provider & { password: string | null }) | null {
+  const row = db
+    .prepare("SELECT * FROM providers WHERE username = ? COLLATE NOCASE")
+    .get(username.trim()) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    ...parseProvider(row),
+    password: (row.password as string | null) ?? null,
+  };
+}
+
+export function isUsernameTaken(username: string): boolean {
+  const row = db
+    .prepare("SELECT id FROM providers WHERE username = ? COLLATE NOCASE")
+    .get(username.trim());
+  return !!row;
 }
 
 export function addProvider(
-  provider: Omit<Provider, "id" | "rating" | "reviews" | "status">
+  provider: Omit<Provider, "id" | "rating" | "reviews" | "status" | "username">
 ): Provider {
   const id =
     "SP-" + Math.random().toString(36).substring(2, 6).toUpperCase().padEnd(3, "0");
@@ -280,10 +385,11 @@ export function addProvider(
     rating: 0,
     reviews: 0,
     status: "Available",
+    username: null,
   };
   db.prepare(`
-    INSERT INTO providers (id, name, phone, vehicle, plate, speciality, rating, reviews, status, avatar)
-    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @rating, @reviews, @status, @avatar)
+    INSERT INTO providers (id, name, phone, vehicle, plate, speciality, rating, reviews, status, avatar, username, password)
+    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @rating, @reviews, @status, @avatar, @username, NULL)
   `).run(newProvider);
   return newProvider;
 }
@@ -298,10 +404,28 @@ export function updateProvider(
   db.prepare(`
     UPDATE providers
     SET name=@name, phone=@phone, vehicle=@vehicle, plate=@plate,
-        speciality=@speciality, rating=@rating, reviews=@reviews, status=@status, avatar=@avatar
+        speciality=@speciality, rating=@rating, reviews=@reviews, status=@status, avatar=@avatar,
+        username=@username
     WHERE id=@id
   `).run(updated);
   return updated;
+}
+
+export function setProviderCredentials(
+  id: string,
+  username: string,
+  passwordHash: string
+): Provider | null {
+  const existing = getProviderById(id);
+  if (!existing) return null;
+
+  db.prepare("UPDATE providers SET username = ?, password = ? WHERE id = ?").run(
+    username.trim(),
+    passwordHash,
+    id
+  );
+
+  return getProviderById(id);
 }
 
 // ------- Request Functions -------
@@ -323,7 +447,7 @@ export function getRequestById(id: string): RequestData | null {
 export function addRequest(
   request: Omit<
     RequestData,
-    "id" | "createdAt" | "status" | "assignedProvider" | "contacted"
+    "id" | "createdAt" | "status" | "assignedProvider" | "contacted" | "arrivalConfirmed"
   >
 ): RequestData {
   const id = "RR-" + Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -333,31 +457,50 @@ export function addRequest(
     status: "received",
     assignedProvider: null,
     contacted: false,
+    arrivalConfirmed: false,
     createdAt: new Date().toISOString(),
   };
   db.prepare(`
     INSERT INTO requests
       (id, name, phone, email, service, vehicleType, vehicleMake, vehicleModel,
        vehicleYear, vehicleColor, location, landmark, notes, status,
-       assignedProvider, contacted, createdAt)
+       assignedProvider, contacted, arrivalConfirmed, createdAt)
     VALUES
       (@id, @name, @phone, @email, @service, @vehicleType, @vehicleMake, @vehicleModel,
        @vehicleYear, @vehicleColor, @location, @landmark, @notes, @status,
-       @assignedProvider, @contacted, @createdAt)
+       @assignedProvider, @contacted, @arrivalConfirmed, @createdAt)
   `).run({
     ...newRequest,
     assignedProvider: null,
     contacted: 0,
+    arrivalConfirmed: 0,
   });
   return newRequest;
 }
 
 export function updateRequest(
   id: string,
-  updates: Partial<RequestData>
+  updates: Partial<RequestData>,
+  options?: { allowCustomerCompletion?: boolean; allowCustomerArrival?: boolean }
 ): RequestData | null {
   const existing = getRequestById(id);
   if (!existing) return null;
+
+  if (updates.arrivalConfirmed && !options?.allowCustomerArrival) {
+    throw new Error("ARRIVAL_REQUIRES_CUSTOMER");
+  }
+
+  if (updates.status === "completed" && !options?.allowCustomerCompletion) {
+    throw new Error("COMPLETION_REQUIRES_CUSTOMER");
+  }
+
+  if (updates.status === "completed" && existing.status !== "arrived") {
+    throw new Error("MUST_BE_ARRIVED");
+  }
+
+  if (updates.status === "arrived" && existing.status !== "arrived") {
+    updates.arrivalConfirmed = false;
+  }
 
   const updated: RequestData = { ...existing, ...updates };
 
@@ -385,7 +528,8 @@ export function updateRequest(
         vehicleType=@vehicleType, vehicleMake=@vehicleMake, vehicleModel=@vehicleModel,
         vehicleYear=@vehicleYear, vehicleColor=@vehicleColor, location=@location,
         landmark=@landmark, notes=@notes, status=@status,
-        assignedProvider=@assignedProvider, contacted=@contacted
+        assignedProvider=@assignedProvider, contacted=@contacted,
+        arrivalConfirmed=@arrivalConfirmed
     WHERE id=@id
   `).run({
     ...updated,
@@ -393,9 +537,26 @@ export function updateRequest(
       ? JSON.stringify(updated.assignedProvider)
       : null,
     contacted: updated.contacted ? 1 : 0,
+    arrivalConfirmed: updated.arrivalConfirmed ? 1 : 0,
   });
 
   return updated;
+}
+
+/** Customer confirms the technician has arrived at their location. */
+export function confirmRequestArrival(id: string): RequestData | null {
+  const existing = getRequestById(id);
+  if (!existing || existing.status !== "arrived") return null;
+  if (existing.arrivalConfirmed) return existing;
+  return updateRequest(id, { arrivalConfirmed: true }, { allowCustomerArrival: true });
+}
+
+/** Mark a request completed after the customer confirms on the tracking page. */
+export function confirmRequestCompletion(id: string): RequestData | null {
+  const existing = getRequestById(id);
+  if (!existing || existing.status !== "arrived") return null;
+  if (!existing.arrivalConfirmed) return null;
+  return updateRequest(id, { status: "completed" }, { allowCustomerCompletion: true });
 }
 
 // ------- Contact Functions -------
@@ -457,33 +618,70 @@ export function updateDisputeStatus(
 
 // ------- Application Functions -------
 
+function parseApplication(row: Record<string, unknown>): Application {
+  return {
+    id: row.id as string,
+    name: row.name as string,
+    phone: row.phone as string,
+    vehicle: row.vehicle as string,
+    plate: row.plate as string,
+    speciality: row.speciality as string,
+    avatar: row.avatar as string,
+    licenseId: row.licenseId as string,
+    licenseImage: (row.licenseImage as string) || "",
+    status: row.status as Application["status"],
+    providerId: (row.providerId as string | null) ?? null,
+    registered: row.registered === 1 || row.registered === true,
+    createdAt: row.createdAt as string,
+  };
+}
+
+export function toApplicationTrackView(app: Application): ApplicationTrackView {
+  return {
+    id: app.id,
+    name: app.name,
+    phone: app.phone,
+    vehicle: app.vehicle,
+    plate: app.plate,
+    speciality: app.speciality,
+    status: app.status,
+    providerId: app.providerId,
+    registered: app.registered,
+    canRegister: app.status === "approved" && !app.registered && !!app.providerId,
+    createdAt: app.createdAt,
+  };
+}
+
 export function getApplications(): Application[] {
   return db
     .prepare("SELECT * FROM applications ORDER BY createdAt DESC")
-    .all() as Application[];
+    .all()
+    .map((row) => parseApplication(row as Record<string, unknown>));
 }
 
 export function getApplicationById(id: string): Application | null {
-  return (
-    (db.prepare("SELECT * FROM applications WHERE id = ?").get(id) as Application) ||
-    null
-  );
+  const row = db
+    .prepare("SELECT * FROM applications WHERE id = ?")
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? parseApplication(row) : null;
 }
 
 export function addApplication(
-  app: Omit<Application, "id" | "status" | "createdAt">
+  app: Omit<Application, "id" | "status" | "createdAt" | "providerId" | "registered">
 ): Application {
   const id = "APP-" + Math.random().toString(36).substring(2, 6).toUpperCase().padEnd(3, "0");
   const newApp: Application = {
     ...app,
     id,
     status: "pending",
+    providerId: null,
+    registered: false,
     createdAt: new Date().toISOString(),
   };
   db.prepare(`
-    INSERT INTO applications (id, name, phone, vehicle, plate, speciality, avatar, licenseId, licenseImage, status, createdAt)
-    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @avatar, @licenseId, @licenseImage, @status, @createdAt)
-  `).run(newApp);
+    INSERT INTO applications (id, name, phone, vehicle, plate, speciality, avatar, licenseId, licenseImage, status, providerId, registered, createdAt)
+    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @avatar, @licenseId, @licenseImage, @status, @providerId, @registered, @createdAt)
+  `).run({ ...newApp, registered: 0 });
   return newApp;
 }
 
@@ -496,23 +694,71 @@ export function updateApplicationStatus(
 
   db.prepare("UPDATE applications SET status = ? WHERE id = ?").run(status, id);
 
-  // If approved, create corresponding active provider
+  let providerId = existing.providerId;
+
   if (status === "approved") {
-    // Check if provider already exists to prevent duplicate key
-    const existingProv = db.prepare("SELECT * FROM providers WHERE name = ? AND phone = ?").get(existing.name, existing.phone);
-    if (!existingProv) {
-      addProvider({
-        name: existing.name,
-        phone: existing.phone,
-        vehicle: existing.vehicle,
-        plate: existing.plate,
-        speciality: existing.speciality,
-        avatar: existing.avatar,
-      });
-    }
+    providerId = linkProviderForApprovedApplication(existing);
+    db.prepare("UPDATE applications SET providerId = ? WHERE id = ?").run(providerId, id);
   }
 
-  return { ...existing, status };
+  return getApplicationById(id);
+}
+
+function linkProviderForApprovedApplication(app: Application): string {
+  const existingProv = db
+    .prepare("SELECT id FROM providers WHERE name = ? AND phone = ?")
+    .get(app.name, app.phone) as { id: string } | undefined;
+
+  if (existingProv) return existingProv.id;
+
+  const provider = addProvider({
+    name: app.name,
+    phone: app.phone,
+    vehicle: app.vehicle,
+    plate: app.plate,
+    speciality: app.speciality,
+    avatar: app.avatar,
+  });
+  return provider.id;
+}
+
+/** Ensures approved applications have a linked provider (fixes legacy rows). */
+export function getApplicationForTracking(id: string): Application | null {
+  const app = getApplicationById(id);
+  if (!app) return null;
+
+  if (app.status === "approved" && !app.providerId) {
+    const providerId = linkProviderForApprovedApplication(app);
+    db.prepare("UPDATE applications SET providerId = ? WHERE id = ?").run(providerId, app.id);
+    return getApplicationById(id);
+  }
+
+  return app;
+}
+
+export function registerApplicationAccount(
+  applicationId: string,
+  username: string,
+  passwordHash: string
+): { application: Application; provider: Provider } | null {
+  const app = getApplicationForTracking(applicationId);
+  if (!app || app.status !== "approved" || app.registered || !app.providerId) {
+    return null;
+  }
+
+  if (isUsernameTaken(username)) {
+    throw new Error("USERNAME_TAKEN");
+  }
+
+  const provider = setProviderCredentials(app.providerId, username, passwordHash);
+  if (!provider) return null;
+
+  db.prepare("UPDATE applications SET registered = 1 WHERE id = ?").run(applicationId);
+
+  const updatedApp = getApplicationById(applicationId);
+  if (!updatedApp) return null;
+
+  return { application: updatedApp, provider };
 }
 
 function seedApplications() {
@@ -522,35 +768,39 @@ function seedApplications() {
   const mockApps = [
     {
       id: "APP-001",
-      name: "John Wayne Towing",
-      phone: "+1 (555) 321-7654",
-      vehicle: "Flatbed Truck (Dodge Ram 5500)",
-      plate: "JW-TOW-1",
+      name: "Musa Bello Towing",
+      phone: "08033217654",
+      vehicle: "Flatbed Truck (Isuzu FRR)",
+      plate: "KAD-TOW1",
       speciality: "towing",
-      avatar: "JW",
-      licenseId: "DL-9827361",
+      avatar: "MB",
+      licenseId: "KAD-9827361",
       licenseImage: "/mock_driver_license.jpg",
       status: "pending",
-      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 4).toISOString(), // 4 hours ago
+      providerId: null,
+      registered: 0,
+      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 4).toISOString(),
     },
     {
       id: "APP-002",
-      name: "Sarah Jenkins Locksmith",
-      phone: "+1 (555) 789-0123",
-      vehicle: "Utility Van (Ford Transit)",
-      plate: "LOCK-SJ7",
+      name: "Fatima Yusuf Locksmith",
+      phone: "08037890123",
+      vehicle: "Utility Van (Toyota HiAce)",
+      plate: "LAG-LS7",
       speciality: "lockout",
-      avatar: "SJ",
-      licenseId: "DL-3847291",
+      avatar: "FY",
+      licenseId: "LAG-3847291",
       licenseImage: "/mock_driver_license.jpg",
       status: "pending",
-      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(), // 2 hours ago
+      providerId: null,
+      registered: 0,
+      createdAt: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString(),
     }
   ];
 
   const insert = db.prepare(`
-    INSERT INTO applications (id, name, phone, vehicle, plate, speciality, avatar, licenseId, licenseImage, status, createdAt)
-    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @avatar, @licenseId, @licenseImage, @status, @createdAt)
+    INSERT INTO applications (id, name, phone, vehicle, plate, speciality, avatar, licenseId, licenseImage, status, providerId, registered, createdAt)
+    VALUES (@id, @name, @phone, @vehicle, @plate, @speciality, @avatar, @licenseId, @licenseImage, @status, @providerId, @registered, @createdAt)
   `);
 
   for (const app of mockApps) {

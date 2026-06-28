@@ -1,9 +1,11 @@
 import { Router, Request, Response } from "express";
+import { verifyPassword } from "../auth";
 import {
   getProviders,
   getProviderById,
   addProvider,
   updateProvider,
+  getProviderByUsername,
 } from "../db";
 
 const router = Router();
@@ -22,6 +24,25 @@ router.get("/", (req: Request, res: Response) => {
     return;
   }
   res.json(getProviders());
+});
+
+// POST /api/providers/login → technician sign in
+router.post("/login", (req: Request, res: Response) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    res.status(400).json({ error: "Username and password are required." });
+    return;
+  }
+
+  const provider = getProviderByUsername(username);
+  if (!provider || !provider.password || !verifyPassword(password, provider.password)) {
+    res.status(401).json({ error: "Invalid username or password." });
+    return;
+  }
+
+  const { password: _, ...publicProvider } = provider;
+  res.json(publicProvider);
 });
 
 // POST /api/providers → add a new provider
