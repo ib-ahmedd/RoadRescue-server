@@ -32,10 +32,17 @@ export interface RequestData {
   location: string;
   landmark: string;
   notes: string;
-  status: "received" | "matched" | "en-route" | "arrived" | "completed";
+  status: "received" | "matched" | "en-route" | "arrived" | "assessing" | "awaiting-payment" | "in-progress" | "completed";
   assignedProvider: Provider | null;
   contacted: boolean;
   arrivalConfirmed: boolean;
+  bookingFee: number;
+  paymentStatus: "pending" | "paid";
+  paymentReference: string;
+  technicianAssessment: string;
+  quoteAmount: number;
+  quoteStatus: "none" | "pending" | "approved" | "rejected" | "paid";
+  quotePaymentReference: string;
   createdAt: string;
 }
 
@@ -226,6 +233,83 @@ try {
 }
 
 try {
+  db.exec("ALTER TABLE requests ADD COLUMN bookingFee INTEGER NOT NULL DEFAULT 0");
+} catch (e) {
+  if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+    console.warn("Migration bookingFee:", e);
+  }
+}
+
+try {
+  db.exec("ALTER TABLE requests ADD COLUMN paymentStatus TEXT NOT NULL DEFAULT 'pending'");
+} catch (e) {
+  if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+    console.warn("Migration paymentStatus:", e);
+  }
+}
+
+try {
+  db.exec("ALTER TABLE requests ADD COLUMN paymentReference TEXT NOT NULL DEFAULT ''");
+} catch (e) {
+  if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+    console.warn("Migration paymentReference:", e);
+  }
+}
+
+try {
+  db.exec("ALTER TABLE requests ADD COLUMN technicianAssessment TEXT NOT NULL DEFAULT ''");
+} catch (e) {
+  if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+    console.warn("Migration technicianAssessment:", e);
+  }
+}
+
+try {
+  db.exec("ALTER TABLE requests ADD COLUMN quoteAmount INTEGER NOT NULL DEFAULT 0");
+} catch (e) {
+  if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+    console.warn("Migration quoteAmount:", e);
+  }
+}
+
+try {
+  db.exec("ALTER TABLE requests ADD COLUMN quoteStatus TEXT NOT NULL DEFAULT 'none'");
+} catch (e) {
+  if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+    console.warn("Migration quoteStatus:", e);
+  }
+}
+
+try {
+  db.exec("ALTER TABLE requests ADD COLUMN quotePaymentReference TEXT NOT NULL DEFAULT ''");
+} catch (e) {
+  if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+    console.warn("Migration quotePaymentReference:", e);
+  }
+}
+
+// Rows confirmed before on-site assessment status existed
+db.prepare(`
+  UPDATE requests
+  SET status = 'assessing'
+  WHERE arrivalConfirmed = 1 AND status = 'arrived'
+`).run();
+
+// Approved quotes should wait for customer payment
+db.prepare(`
+  UPDATE requests
+  SET status = 'awaiting-payment'
+  WHERE quoteStatus = 'approved' AND status = 'assessing'
+`).run();
+
+// Paid quotes move into active on-site service
+db.prepare(`
+  UPDATE requests
+  SET status = 'in-progress'
+  WHERE quoteStatus = 'paid' AND status IN ('assessing', 'awaiting-payment', 'arrived')
+`).run();
+
+try {
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_username ON providers(username) WHERE username IS NOT NULL");
 } catch (e) {
   // Index already exists
@@ -317,6 +401,13 @@ function parseRequest(row: Record<string, unknown>): RequestData {
       : null,
     contacted: row.contacted === 1,
     arrivalConfirmed: row.arrivalConfirmed === 1 || row.arrivalConfirmed === true,
+    bookingFee: Number(row.bookingFee ?? 0),
+    paymentStatus: (row.paymentStatus as RequestData["paymentStatus"]) || "pending",
+    paymentReference: (row.paymentReference as string) || "",
+    technicianAssessment: (row.technicianAssessment as string) || "",
+    quoteAmount: Number(row.quoteAmount ?? 0),
+    quoteStatus: (row.quoteStatus as RequestData["quoteStatus"]) || "none",
+    quotePaymentReference: (row.quotePaymentReference as string) || "",
   };
 }
 
@@ -444,10 +535,63 @@ export function getRequestById(id: string): RequestData | null {
   return row ? parseRequest(row) : null;
 }
 
+function normalizePhoneDigits(phone: string): string {
+  let digits = phone.replace(/\D/g, "");
+  if (digits.startsWith("234") && digits.length >= 13) {
+    digits = "0" + digits.slice(3);
+  }
+  return digits;
+}
+
+function phoneTail(phone: string): string {
+  const digits = normalizePhoneDigits(phone);
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+}
+
+/** Find the most recent non-completed request matching phone, email, and service. */
+export function findActiveRequestByCredentials(
+  phone: string,
+  email: string,
+  service: string
+): RequestData | null {
+  const phoneKey = phoneTail(phone);
+  const emailNorm = email.trim().toLowerCase();
+  const serviceNorm = service.trim().toLowerCase();
+
+  if (!phoneKey || !emailNorm || !serviceNorm) return null;
+
+  const rows = db
+    .prepare(`
+      SELECT * FROM requests
+      WHERE LOWER(service) = ?
+        AND LOWER(TRIM(email)) = ?
+        AND status != 'completed'
+      ORDER BY createdAt DESC
+    `)
+    .all(serviceNorm, emailNorm) as Record<string, unknown>[];
+
+  for (const row of rows) {
+    if (phoneTail(row.phone as string) === phoneKey) {
+      return parseRequest(row);
+    }
+  }
+
+  return null;
+}
+
 export function addRequest(
   request: Omit<
     RequestData,
-    "id" | "createdAt" | "status" | "assignedProvider" | "contacted" | "arrivalConfirmed"
+    | "id"
+    | "createdAt"
+    | "status"
+    | "assignedProvider"
+    | "contacted"
+    | "arrivalConfirmed"
+    | "technicianAssessment"
+    | "quoteAmount"
+    | "quoteStatus"
+    | "quotePaymentReference"
   >
 ): RequestData {
   const id = "RR-" + Math.random().toString(36).substring(2, 8).toUpperCase();
@@ -458,17 +602,28 @@ export function addRequest(
     assignedProvider: null,
     contacted: false,
     arrivalConfirmed: false,
+    bookingFee: request.bookingFee ?? 0,
+    paymentStatus: request.paymentStatus ?? "pending",
+    paymentReference: request.paymentReference ?? "",
+    technicianAssessment: "",
+    quoteAmount: 0,
+    quoteStatus: "none",
+    quotePaymentReference: "",
     createdAt: new Date().toISOString(),
   };
   db.prepare(`
     INSERT INTO requests
       (id, name, phone, email, service, vehicleType, vehicleMake, vehicleModel,
        vehicleYear, vehicleColor, location, landmark, notes, status,
-       assignedProvider, contacted, arrivalConfirmed, createdAt)
+       assignedProvider, contacted, arrivalConfirmed, bookingFee, paymentStatus,
+       paymentReference, technicianAssessment, quoteAmount, quoteStatus,
+       quotePaymentReference, createdAt)
     VALUES
       (@id, @name, @phone, @email, @service, @vehicleType, @vehicleMake, @vehicleModel,
        @vehicleYear, @vehicleColor, @location, @landmark, @notes, @status,
-       @assignedProvider, @contacted, @arrivalConfirmed, @createdAt)
+       @assignedProvider, @contacted, @arrivalConfirmed, @bookingFee, @paymentStatus,
+       @paymentReference, @technicianAssessment, @quoteAmount, @quoteStatus,
+       @quotePaymentReference, @createdAt)
   `).run({
     ...newRequest,
     assignedProvider: null,
@@ -494,11 +649,11 @@ export function updateRequest(
     throw new Error("COMPLETION_REQUIRES_CUSTOMER");
   }
 
-  if (updates.status === "completed" && existing.status !== "arrived") {
-    throw new Error("MUST_BE_ARRIVED");
+  if (updates.status === "completed" && existing.status !== "arrived" && existing.status !== "in-progress") {
+    throw new Error("MUST_BE_ON_SITE");
   }
 
-  if (updates.status === "arrived" && existing.status !== "arrived") {
+  if (updates.status === "arrived" && existing.status === "en-route") {
     updates.arrivalConfirmed = false;
   }
 
@@ -529,7 +684,10 @@ export function updateRequest(
         vehicleYear=@vehicleYear, vehicleColor=@vehicleColor, location=@location,
         landmark=@landmark, notes=@notes, status=@status,
         assignedProvider=@assignedProvider, contacted=@contacted,
-        arrivalConfirmed=@arrivalConfirmed
+        arrivalConfirmed=@arrivalConfirmed, bookingFee=@bookingFee,
+        paymentStatus=@paymentStatus, paymentReference=@paymentReference,
+        technicianAssessment=@technicianAssessment, quoteAmount=@quoteAmount,
+        quoteStatus=@quoteStatus, quotePaymentReference=@quotePaymentReference
     WHERE id=@id
   `).run({
     ...updated,
@@ -543,20 +701,91 @@ export function updateRequest(
   return updated;
 }
 
-/** Customer confirms the technician has arrived at their location. */
+/** Customer confirms arrival; request moves to on-site assessment. */
 export function confirmRequestArrival(id: string): RequestData | null {
   const existing = getRequestById(id);
-  if (!existing || existing.status !== "arrived") return null;
-  if (existing.arrivalConfirmed) return existing;
-  return updateRequest(id, { arrivalConfirmed: true }, { allowCustomerArrival: true });
+  if (!existing) return null;
+
+  if (existing.arrivalConfirmed && existing.status !== "arrived") {
+    return existing;
+  }
+
+  if (existing.status !== "arrived") return null;
+
+  if (existing.arrivalConfirmed) {
+    return updateRequest(id, { status: "assessing" });
+  }
+
+  return updateRequest(
+    id,
+    { arrivalConfirmed: true, status: "assessing" },
+    { allowCustomerArrival: true }
+  );
 }
 
 /** Mark a request completed after the customer confirms on the tracking page. */
 export function confirmRequestCompletion(id: string): RequestData | null {
   const existing = getRequestById(id);
-  if (!existing || existing.status !== "arrived") return null;
-  if (!existing.arrivalConfirmed) return null;
+  if (!existing) return null;
+  if (existing.quoteStatus === "approved" || existing.status === "awaiting-payment") return null;
+  if (existing.status !== "arrived" && existing.status !== "in-progress") return null;
+  if (existing.status === "arrived" && !existing.arrivalConfirmed) return null;
   return updateRequest(id, { status: "completed" }, { allowCustomerCompletion: true });
+}
+
+export function submitQuote(
+  id: string,
+  providerId: string,
+  data: { technicianAssessment: string; quoteAmount: number }
+): RequestData | null {
+  const existing = getRequestById(id);
+  if (!existing) return null;
+  if (existing.status !== "assessing") return null;
+  if (!existing.assignedProvider || existing.assignedProvider.id !== providerId) return null;
+
+  const currentQuoteStatus = existing.quoteStatus || "none";
+  if (currentQuoteStatus !== "none" && currentQuoteStatus !== "rejected") return null;
+
+  const assessment = data.technicianAssessment.trim();
+  const amount = Number(data.quoteAmount);
+  if (assessment.length < 20) return null;
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  return updateRequest(id, {
+    technicianAssessment: assessment,
+    quoteAmount: Math.round(amount),
+    quoteStatus: "pending",
+    quotePaymentReference: "",
+    status: "assessing",
+  });
+}
+
+export function reviewQuote(
+  id: string,
+  action: "approve" | "reject"
+): RequestData | null {
+  const existing = getRequestById(id);
+  if (!existing || existing.quoteStatus !== "pending") return null;
+
+  return updateRequest(id, {
+    quoteStatus: action === "approve" ? "approved" : "rejected",
+    status: action === "approve" ? "awaiting-payment" : "assessing",
+  });
+}
+
+export function payQuote(id: string, paymentReference: string): RequestData | null {
+  const existing = getRequestById(id);
+  if (!existing) return null;
+  if (existing.quoteStatus !== "approved") return null;
+  if (existing.status !== "awaiting-payment" && existing.status !== "assessing") return null;
+  if (existing.quoteAmount <= 0) return null;
+  if (!paymentReference || typeof paymentReference !== "string") return null;
+
+  return updateRequest(id, {
+    quoteStatus: "paid",
+    quotePaymentReference: paymentReference.trim(),
+    status: "in-progress",
+  });
 }
 
 // ------- Contact Functions -------
