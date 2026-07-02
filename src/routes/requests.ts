@@ -7,6 +7,7 @@ import {
   updateRequest,
   confirmRequestCompletion,
   confirmRequestArrival,
+  markRequestCompleteByTechnician,
   submitQuote,
   reviewQuote,
   payQuote,
@@ -113,7 +114,7 @@ router.post("/confirm-arrival", (req: Request, res: Response) => {
   }
 });
 
-// POST /api/requests/confirm-completion → customer confirms job is done
+// POST /api/requests/confirm-completion → customer acknowledges technician-completed job
 router.post("/confirm-completion", (req: Request, res: Response) => {
   const { id } = req.body;
   if (!id) {
@@ -122,18 +123,10 @@ router.post("/confirm-completion", (req: Request, res: Response) => {
   }
 
   try {
-    const existing = getRequestById(id);
-    if (existing?.quoteStatus === "approved" || existing?.status === "awaiting-payment") {
-      res.status(400).json({
-        error: "Please pay the approved service quote before marking the job complete.",
-      });
-      return;
-    }
-
     const updated = confirmRequestCompletion(id);
     if (!updated) {
       res.status(400).json({
-        error: "Please confirm the technician has arrived before marking the job complete.",
+        error: "Completion can only be acknowledged after the technician has marked the job complete.",
       });
       return;
     }
@@ -141,6 +134,29 @@ router.post("/confirm-completion", (req: Request, res: Response) => {
   } catch (err) {
     console.error("POST /api/requests/confirm-completion error:", err);
     res.status(500).json({ error: "Failed to confirm completion." });
+  }
+});
+
+// POST /api/requests/mark-complete → assigned technician marks job complete
+router.post("/mark-complete", (req: Request, res: Response) => {
+  const { id, providerId } = req.body;
+  if (!id || !providerId) {
+    res.status(400).json({ error: "Missing request ID or provider ID" });
+    return;
+  }
+
+  try {
+    const updated = markRequestCompleteByTechnician(id, providerId);
+    if (!updated) {
+      res.status(400).json({
+        error: "Job can only be marked complete while service is in progress, by the assigned technician.",
+      });
+      return;
+    }
+    res.json(updated);
+  } catch (err) {
+    console.error("POST /api/requests/mark-complete error:", err);
+    res.status(500).json({ error: "Failed to mark job complete." });
   }
 });
 
@@ -236,21 +252,33 @@ router.patch("/", (req: Request, res: Response) => {
     }
     res.json(updated);
   } catch (err) {
-    if (err instanceof Error && err.message === "COMPLETION_REQUIRES_CUSTOMER") {
+    if (err instanceof Error && err.message === "COMPLETION_REQUIRES_TECHNICIAN") {
       res.status(403).json({
-        error: "Only the customer can mark this job as completed from the tracking page.",
+        error: "Only the assigned technician can mark this job as completed.",
+      });
+      return;
+    }
+    if (err instanceof Error && err.message === "COMPLETION_ACK_REQUIRES_CUSTOMER") {
+      res.status(403).json({
+        error: "Only the customer can acknowledge completion from the tracking page.",
+      });
+      return;
+    }
+    if (err instanceof Error && err.message === "MUST_BE_IN_PROGRESS") {
+      res.status(400).json({
+        error: "Service must be in progress before the job can be marked complete.",
+      });
+      return;
+    }
+    if (err instanceof Error && err.message === "DISPUTED_REQUIRES_DISPUTE") {
+      res.status(403).json({
+        error: "Request status can only be set to disputed through the dispute flow.",
       });
       return;
     }
     if (err instanceof Error && err.message === "ARRIVAL_REQUIRES_CUSTOMER") {
       res.status(403).json({
         error: "Only the customer can confirm technician arrival from the tracking page.",
-      });
-      return;
-    }
-    if (err instanceof Error && err.message === "MUST_BE_ON_SITE") {
-      res.status(400).json({
-        error: "The technician must be on site before the customer can confirm completion.",
       });
       return;
     }

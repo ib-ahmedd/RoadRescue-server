@@ -23,7 +23,7 @@ router.post("/", (req: Request, res: Response) => {
   }
 
   const dispute = addDispute({ requestId, customerName, customerPhone, reason, description });
-  res.status(201).json({ success: true, dispute });
+  res.status(201).json({ success: true, dispute: dispute.dispute, request: dispute.request });
 });
 
 // PATCH /api/disputes → update dispute status (admin)
@@ -35,13 +35,13 @@ router.patch("/", (req: Request, res: Response) => {
     return;
   }
 
-  const updated = updateDisputeStatus(id, status);
-  if (!updated) {
+  const result = updateDisputeStatus(id, status);
+  if (!result) {
     res.status(404).json({ error: "Dispute not found" });
     return;
   }
 
-  res.json(updated);
+  res.json({ dispute: result.dispute, request: result.request });
 });
 
 export default router;
