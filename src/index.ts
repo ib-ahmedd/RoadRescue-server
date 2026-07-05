@@ -5,6 +5,8 @@ import requestsRouter from "./routes/requests";
 import contactRouter from "./routes/contact";
 import disputesRouter from "./routes/disputes";
 import applicationsRouter from "./routes/applications";
+import paymentsRouter from "./routes/payments";
+import technicianCreditsRouter from "./routes/technicianCredits";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -25,6 +27,8 @@ app.use("/api/requests", requestsRouter);
 app.use("/api/contact", contactRouter);
 app.use("/api/disputes", disputesRouter);
 app.use("/api/applications", applicationsRouter);
+app.use("/api/payments", paymentsRouter);
+app.use("/api/technician-credits", technicianCreditsRouter);
 
 // ── Health check ────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {

@@ -112,6 +112,53 @@ export interface ApplicationTrackView {
   createdAt: string;
 }
 
+export type PaymentType = "booking_fee" | "quote_payment";
+
+export interface Payment {
+  id: string;
+  requestId: string;
+  customerName: string;
+  type: PaymentType;
+  sourceAmount: number;
+  rate: number;
+  amount: number;
+  reference: string;
+  createdAt: string;
+}
+
+export interface PaymentSummary {
+  accountBalance: number;
+  bookingFeeTotal: number;
+  quotePaymentTotal: number;
+  transactionCount: number;
+}
+
+export type TechnicianCreditType = "booking_commission" | "quote_commission";
+
+export interface TechnicianCredit {
+  id: string;
+  providerId: string;
+  requestId: string;
+  customerName: string;
+  type: TechnicianCreditType;
+  sourceAmount: number;
+  rate: number;
+  amount: number;
+  createdAt: string;
+}
+
+export interface TechnicianBalanceSummary {
+  accountBalance: number;
+  bookingCommissionTotal: number;
+  quoteCommissionTotal: number;
+  transactionCount: number;
+}
+
+const BOOKING_COMMISSION_RATE = 0.5;
+const QUOTE_COMMISSION_RATE = 0.7;
+const ADMIN_BOOKING_FEE_RATE = 0.5;
+const ADMIN_QUOTE_PAYMENT_RATE = 0.3;
+
 // ------- Database Setup -------
 
 const dbFile = path.join(SERVER_ROOT, "data", "roadrescue.db");
@@ -338,6 +385,77 @@ try {
 } catch (e) {
   // Index already exists
 }
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS payments (
+    id           TEXT PRIMARY KEY,
+    requestId    TEXT NOT NULL,
+    customerName TEXT NOT NULL,
+    type         TEXT NOT NULL,
+    sourceAmount INTEGER NOT NULL DEFAULT 0,
+    rate         REAL NOT NULL DEFAULT 0,
+    amount       INTEGER NOT NULL,
+    reference    TEXT NOT NULL,
+    createdAt    TEXT NOT NULL,
+    UNIQUE(requestId, type)
+  );
+
+  CREATE TABLE IF NOT EXISTS technician_credits (
+    id           TEXT PRIMARY KEY,
+    providerId   TEXT NOT NULL,
+    requestId    TEXT NOT NULL,
+    customerName TEXT NOT NULL,
+    type         TEXT NOT NULL,
+    sourceAmount INTEGER NOT NULL,
+    rate         REAL NOT NULL,
+    amount       INTEGER NOT NULL,
+    createdAt    TEXT NOT NULL,
+    UNIQUE(requestId, type)
+  );
+`);
+
+try {
+  db.exec("ALTER TABLE payments ADD COLUMN sourceAmount INTEGER NOT NULL DEFAULT 0");
+} catch (e) {
+  // Column already exists
+}
+
+try {
+  db.exec("ALTER TABLE payments ADD COLUMN rate REAL NOT NULL DEFAULT 0");
+} catch (e) {
+  // Column already exists
+}
+
+function migratePaymentCommissionAmounts() {
+  const legacyRows = db
+    .prepare(`
+      SELECT id, type, amount
+      FROM payments
+      WHERE sourceAmount = 0 OR rate = 0
+    `)
+    .all() as Array<{ id: string; type: PaymentType; amount: number }>;
+
+  const update = db.prepare(`
+    UPDATE payments
+    SET sourceAmount = @sourceAmount, rate = @rate, amount = @amount
+    WHERE id = @id
+  `);
+
+  for (const row of legacyRows) {
+    const rate = row.type === "booking_fee" ? ADMIN_BOOKING_FEE_RATE : ADMIN_QUOTE_PAYMENT_RATE;
+    const sourceAmount = Math.round(Number(row.amount));
+    if (!Number.isFinite(sourceAmount) || sourceAmount <= 0) continue;
+
+    update.run({
+      id: row.id,
+      sourceAmount,
+      rate,
+      amount: Math.round(sourceAmount * rate),
+    });
+  }
+}
+
+migratePaymentCommissionAmounts();
 
 // ------- Seed initial data from db.json if tables are empty -------
 
@@ -670,6 +788,15 @@ export function addRequest(
     completionConfirmed: 0,
     technicianMarkedComplete: 0,
   });
+
+  if (
+    newRequest.paymentStatus === "paid" &&
+    newRequest.paymentReference &&
+    newRequest.bookingFee > 0
+  ) {
+    maybeRecordBookingFeePayment(newRequest);
+  }
+
   return newRequest;
 }
 
@@ -744,11 +871,12 @@ export function updateRequest(
   const updated: RequestData = { ...existing, ...updates };
 
   // If a provider was newly assigned, mark them as Dispatched
-  if (
+  const providerNewlyAssigned =
     updates.assignedProvider &&
     (!existing.assignedProvider ||
-      existing.assignedProvider.id !== updates.assignedProvider.id)
-  ) {
+      existing.assignedProvider.id !== updates.assignedProvider.id);
+
+  if (providerNewlyAssigned && updates.assignedProvider) {
     db.prepare("UPDATE providers SET status = 'Dispatched' WHERE id = ?").run(
       updates.assignedProvider.id
     );
@@ -784,6 +912,10 @@ export function updateRequest(
     completionConfirmed: updated.completionConfirmed ? 1 : 0,
     technicianMarkedComplete: updated.technicianMarkedComplete ? 1 : 0,
   });
+
+  if (providerNewlyAssigned) {
+    maybeCreditBookingCommission(updated);
+  }
 
   return updated;
 }
@@ -835,11 +967,22 @@ export function confirmRequestCompletion(id: string): RequestData | null {
   if (existing.status !== "in-progress" || !existing.technicianMarkedComplete) return null;
   if (existing.completionConfirmed) return existing;
 
-  return updateRequest(
+  const updated = updateRequest(
     id,
     { status: "completed", completionConfirmed: true, technicianMarkedComplete: false },
     { allowCustomerCompletion: true }
   );
+
+  if (
+    updated &&
+    updated.quoteStatus === "paid" &&
+    updated.quoteAmount > 0 &&
+    updated.assignedProvider
+  ) {
+    maybeCreditQuoteCommission(updated);
+  }
+
+  return updated;
 }
 
 export function submitQuote(
@@ -890,11 +1033,264 @@ export function payQuote(id: string, paymentReference: string): RequestData | nu
   if (existing.quoteAmount <= 0) return null;
   if (!paymentReference || typeof paymentReference !== "string") return null;
 
-  return updateRequest(id, {
+  const updated = updateRequest(id, {
     quoteStatus: "paid",
     quotePaymentReference: paymentReference.trim(),
     status: "in-progress",
   });
+
+  if (updated) {
+    maybeRecordQuotePayment(updated, paymentReference.trim());
+  }
+
+  return updated;
+}
+
+// ------- Payment Functions -------
+
+export function recordPayment(input: {
+  requestId: string;
+  customerName: string;
+  type: PaymentType;
+  sourceAmount: number;
+  rate: number;
+  amount: number;
+  reference: string;
+  createdAt?: string;
+}): Payment | null {
+  const reference = input.reference.trim();
+  const sourceAmount = Math.round(Number(input.sourceAmount));
+  const amount = Math.round(Number(input.amount));
+  if (!reference || !Number.isFinite(amount) || amount <= 0) return null;
+
+  const id = "PAY-" + Math.random().toString(36).substring(2, 8).toUpperCase();
+  const createdAt = input.createdAt ?? new Date().toISOString();
+
+  try {
+    db.prepare(`
+      INSERT INTO payments
+        (id, requestId, customerName, type, sourceAmount, rate, amount, reference, createdAt)
+      VALUES
+        (@id, @requestId, @customerName, @type, @sourceAmount, @rate, @amount, @reference, @createdAt)
+    `).run({
+      id,
+      requestId: input.requestId,
+      customerName: input.customerName,
+      type: input.type,
+      sourceAmount,
+      rate: input.rate,
+      amount,
+      reference,
+      createdAt,
+    });
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("UNIQUE constraint failed")) {
+      return null;
+    }
+    throw e;
+  }
+
+  return {
+    id,
+    requestId: input.requestId,
+    customerName: input.customerName,
+    type: input.type,
+    sourceAmount,
+    rate: input.rate,
+    amount,
+    reference,
+    createdAt,
+  };
+}
+
+export function maybeRecordBookingFeePayment(
+  request: Pick<RequestData, "id" | "name" | "bookingFee" | "paymentReference" | "createdAt">
+): Payment | null {
+  if (request.bookingFee <= 0 || !request.paymentReference) return null;
+
+  return recordPayment({
+    requestId: request.id,
+    customerName: request.name,
+    type: "booking_fee",
+    sourceAmount: request.bookingFee,
+    rate: ADMIN_BOOKING_FEE_RATE,
+    amount: Math.round(request.bookingFee * ADMIN_BOOKING_FEE_RATE),
+    reference: request.paymentReference,
+    createdAt: request.createdAt,
+  });
+}
+
+export function maybeRecordQuotePayment(
+  request: Pick<RequestData, "id" | "name" | "quoteAmount" | "quoteStatus">,
+  reference: string
+): Payment | null {
+  if (request.quoteStatus !== "paid" || request.quoteAmount <= 0 || !reference) return null;
+
+  return recordPayment({
+    requestId: request.id,
+    customerName: request.name,
+    type: "quote_payment",
+    sourceAmount: request.quoteAmount,
+    rate: ADMIN_QUOTE_PAYMENT_RATE,
+    amount: Math.round(request.quoteAmount * ADMIN_QUOTE_PAYMENT_RATE),
+    reference,
+  });
+}
+
+export function getPayments(): Payment[] {
+  return db
+    .prepare("SELECT * FROM payments ORDER BY datetime(createdAt) DESC")
+    .all() as Payment[];
+}
+
+export function getPaymentSummary(): PaymentSummary {
+  const row = db
+    .prepare(`
+      SELECT
+        COALESCE(SUM(amount), 0) AS accountBalance,
+        COALESCE(SUM(CASE WHEN type = 'booking_fee' THEN amount ELSE 0 END), 0) AS bookingFeeTotal,
+        COALESCE(SUM(CASE WHEN type = 'quote_payment' THEN amount ELSE 0 END), 0) AS quotePaymentTotal,
+        COUNT(*) AS transactionCount
+      FROM payments
+    `)
+    .get() as {
+      accountBalance: number;
+      bookingFeeTotal: number;
+      quotePaymentTotal: number;
+      transactionCount: number;
+    };
+
+  return {
+    accountBalance: row.accountBalance,
+    bookingFeeTotal: row.bookingFeeTotal,
+    quotePaymentTotal: row.quotePaymentTotal,
+    transactionCount: row.transactionCount,
+  };
+}
+
+// ------- Technician Credit Functions -------
+
+export function recordTechnicianCredit(input: {
+  providerId: string;
+  requestId: string;
+  customerName: string;
+  type: TechnicianCreditType;
+  sourceAmount: number;
+  rate: number;
+  amount: number;
+  createdAt?: string;
+}): TechnicianCredit | null {
+  const sourceAmount = Math.round(Number(input.sourceAmount));
+  const amount = Math.round(Number(input.amount));
+  if (!input.providerId || !input.requestId || !Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+
+  const id = "TC-" + Math.random().toString(36).substring(2, 8).toUpperCase();
+  const createdAt = input.createdAt ?? new Date().toISOString();
+
+  try {
+    db.prepare(`
+      INSERT INTO technician_credits
+        (id, providerId, requestId, customerName, type, sourceAmount, rate, amount, createdAt)
+      VALUES
+        (@id, @providerId, @requestId, @customerName, @type, @sourceAmount, @rate, @amount, @createdAt)
+    `).run({
+      id,
+      providerId: input.providerId,
+      requestId: input.requestId,
+      customerName: input.customerName,
+      type: input.type,
+      sourceAmount,
+      rate: input.rate,
+      amount,
+      createdAt,
+    });
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("UNIQUE constraint failed")) {
+      return null;
+    }
+    throw e;
+  }
+
+  return {
+    id,
+    providerId: input.providerId,
+    requestId: input.requestId,
+    customerName: input.customerName,
+    type: input.type,
+    sourceAmount,
+    rate: input.rate,
+    amount,
+    createdAt,
+  };
+}
+
+export function maybeCreditBookingCommission(request: RequestData): TechnicianCredit | null {
+  if (request.paymentStatus !== "paid" || request.bookingFee <= 0 || !request.assignedProvider) {
+    return null;
+  }
+
+  return recordTechnicianCredit({
+    providerId: request.assignedProvider.id,
+    requestId: request.id,
+    customerName: request.name,
+    type: "booking_commission",
+    sourceAmount: request.bookingFee,
+    rate: BOOKING_COMMISSION_RATE,
+    amount: Math.round(request.bookingFee * BOOKING_COMMISSION_RATE),
+    createdAt: request.createdAt,
+  });
+}
+
+export function maybeCreditQuoteCommission(request: RequestData): TechnicianCredit | null {
+  if (request.quoteStatus !== "paid" || request.quoteAmount <= 0 || !request.assignedProvider) {
+    return null;
+  }
+
+  return recordTechnicianCredit({
+    providerId: request.assignedProvider.id,
+    requestId: request.id,
+    customerName: request.name,
+    type: "quote_commission",
+    sourceAmount: request.quoteAmount,
+    rate: QUOTE_COMMISSION_RATE,
+    amount: Math.round(request.quoteAmount * QUOTE_COMMISSION_RATE),
+  });
+}
+
+export function getTechnicianCredits(providerId: string): TechnicianCredit[] {
+  return db
+    .prepare(
+      "SELECT * FROM technician_credits WHERE providerId = ? ORDER BY datetime(createdAt) DESC"
+    )
+    .all(providerId) as TechnicianCredit[];
+}
+
+export function getTechnicianBalanceSummary(providerId: string): TechnicianBalanceSummary {
+  const row = db
+    .prepare(`
+      SELECT
+        COALESCE(SUM(amount), 0) AS accountBalance,
+        COALESCE(SUM(CASE WHEN type = 'booking_commission' THEN amount ELSE 0 END), 0) AS bookingCommissionTotal,
+        COALESCE(SUM(CASE WHEN type = 'quote_commission' THEN amount ELSE 0 END), 0) AS quoteCommissionTotal,
+        COUNT(*) AS transactionCount
+      FROM technician_credits
+      WHERE providerId = ?
+    `)
+    .get(providerId) as {
+      accountBalance: number;
+      bookingCommissionTotal: number;
+      quoteCommissionTotal: number;
+      transactionCount: number;
+    };
+
+  return {
+    accountBalance: row.accountBalance,
+    bookingCommissionTotal: row.bookingCommissionTotal,
+    quoteCommissionTotal: row.quoteCommissionTotal,
+    transactionCount: row.transactionCount,
+  };
 }
 
 // ------- Contact Functions -------
@@ -1182,5 +1578,95 @@ function seedApplications() {
 
 // Run application seeder
 seedApplications();
+
+function backfillPaymentsFromRequests() {
+  const bookingRows = db
+    .prepare(`
+      SELECT id, name, bookingFee, paymentReference, createdAt
+      FROM requests
+      WHERE paymentStatus = 'paid' AND paymentReference != '' AND bookingFee > 0
+    `)
+    .all() as Array<{
+      id: string;
+      name: string;
+      bookingFee: number;
+      paymentReference: string;
+      createdAt: string;
+    }>;
+
+  for (const row of bookingRows) {
+    maybeRecordBookingFeePayment({
+      id: row.id,
+      name: row.name,
+      bookingFee: row.bookingFee,
+      paymentReference: row.paymentReference,
+      createdAt: row.createdAt,
+    });
+  }
+
+  const quoteRows = db
+    .prepare(`
+      SELECT id, name, quoteAmount, quotePaymentReference, createdAt
+      FROM requests
+      WHERE quoteStatus = 'paid' AND quotePaymentReference != '' AND quoteAmount > 0
+    `)
+    .all() as Array<{
+      id: string;
+      name: string;
+      quoteAmount: number;
+      quotePaymentReference: string;
+      createdAt: string;
+    }>;
+
+  for (const row of quoteRows) {
+    maybeRecordQuotePayment(
+      {
+        id: row.id,
+        name: row.name,
+        quoteAmount: row.quoteAmount,
+        quoteStatus: "paid",
+      },
+      row.quotePaymentReference
+    );
+  }
+}
+
+backfillPaymentsFromRequests();
+
+function backfillTechnicianCreditsFromRequests() {
+  const assignedIds = db
+    .prepare(`
+      SELECT id
+      FROM requests
+      WHERE assignedProvider IS NOT NULL
+        AND paymentStatus = 'paid'
+        AND bookingFee > 0
+    `)
+    .all() as Array<{ id: string }>;
+
+  for (const { id } of assignedIds) {
+    const request = getRequestById(id);
+    if (request) maybeCreditBookingCommission(request);
+  }
+
+  const completedQuoteIds = db
+    .prepare(`
+      SELECT id
+      FROM requests
+      WHERE status = 'completed'
+        AND completionConfirmed = 1
+        AND quoteStatus = 'paid'
+        AND quoteAmount > 0
+        AND assignedProvider IS NOT NULL
+    `)
+    .all() as Array<{ id: string }>;
+
+  for (const { id } of completedQuoteIds) {
+    const request = getRequestById(id);
+    if (request) maybeCreditQuoteCommission(request);
+  }
+}
+
+backfillTechnicianCreditsFromRequests();
 
 export default db;
