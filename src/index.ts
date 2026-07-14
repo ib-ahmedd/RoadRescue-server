@@ -14,7 +14,7 @@ const PORT = process.env.PORT || 5000;
 // ── Middleware ──────────────────────────────────────────────────────────────
 app.use(
   cors({
-    origin: ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
+    origin: ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "https://road-rescue-admin-virid.vercel.app", "https://road-rescue-wheat.vercel.app", "https://road-rescue-technicians.vercel.app/dashboard"],
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "cache-control", "pragma"],
   })
